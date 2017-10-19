@@ -16,7 +16,7 @@ namespace StackExchange.Redis
 
         private readonly string name;
 
-        int activeAsyncWorkerThread = 0;
+        private bool asyncWorkerQueued;
         long completedSync, completedAsync, failedAsync;
         public CompletionManager(ConnectionMultiplexer multiplexer, string name)
         {
@@ -41,7 +41,8 @@ namespace StackExchange.Redis
                     lock (asyncCompletionQueue)
                     {
                         asyncCompletionQueue.Enqueue(operation);
-                        startNewWorker = asyncCompletionQueue.Count == 1;
+                        startNewWorker = !asyncWorkerQueued;
+                        asyncWorkerQueued = true;
                     }
                     if (startNewWorker)
                     {
@@ -113,78 +114,33 @@ namespace StackExchange.Redis
         partial void OnCompletedAsync();
         private void ProcessAsyncCompletionQueueImpl()
         {
-            int currentThread = Environment.CurrentManagedThreadId;
-            try
-            {
-                while (Interlocked.CompareExchange(ref activeAsyncWorkerThread, currentThread, 0) != 0)
-                {
-                    // if we don't win the lock, check whether there is still work; if there is we
-                    // need to retry to prevent a nasty race condition
-                    lock(asyncCompletionQueue)
-                    {
-                        if (asyncCompletionQueue.Count == 0) return; // another thread drained it; can exit
-                    }
-                    Thread.Sleep(1);
-                }
-                int total = 0;
-                do
-                {
-                    ICompletable next;
-                    lock (asyncCompletionQueue)
-                    {
-                        next = asyncCompletionQueue.Count == 0 ? null
-                            : asyncCompletionQueue.Dequeue();
-                    }
-                    if (next == null)
-                    {
-                        // give it a moment and try again, noting that we might lose the battle
-                        // when we pause
-                        Interlocked.CompareExchange(ref activeAsyncWorkerThread, 0, currentThread);
-                        if (SpinWait() && Interlocked.CompareExchange(ref activeAsyncWorkerThread, currentThread, 0) == 0)
-                        {
-                            // we paused, and we got the lock back; anything else?
-                            lock (asyncCompletionQueue)
-                            {
-                                next = asyncCompletionQueue.Count == 0 ? null
-                                    : asyncCompletionQueue.Dequeue();
-                            }
-                        }
-                    }
-                    if (next == null) break; // nothing to do <===== exit point
-                    try
-                    {
-                        multiplexer.Trace("Completing async (ordered): " + next, name);
-                        next.TryComplete(true);
-                        Interlocked.Increment(ref completedAsync);
-                    }
-                    catch (Exception ex)
-                    {
-                        multiplexer.Trace("Async completion error: " + ex.Message, name);
-                        Interlocked.Increment(ref failedAsync);
-                    }
-                    total++;
-                } while (true);
-                multiplexer.Trace("Async completion worker processed " + total + " operations", name);
-            }
-            finally
-            {
-                Interlocked.CompareExchange(ref activeAsyncWorkerThread, 0, currentThread);
-            }
-        }
-
-        private bool SpinWait()
-        {
-            var sw = new SpinWait();
-            byte maxSpins = 128;
+            int total = 0;
             do
             {
-                if (sw.NextSpinWillYield)
-                    return true;
-                maxSpins--;
-            }
-            while (maxSpins > 0);
-
-            return false;
+                ICompletable next;
+                lock (asyncCompletionQueue)
+                {
+                    if (asyncCompletionQueue.Count == 0)
+                    {
+                        asyncWorkerQueued = false;
+                        break;
+                    }
+                    next = asyncCompletionQueue.Dequeue();
+                }
+                try
+                {
+                    multiplexer.Trace("Completing async (ordered): " + next, name);
+                    next.TryComplete(true);
+                    Interlocked.Increment(ref completedAsync);
+                }
+                catch (Exception ex)
+                {
+                    multiplexer.Trace("Async completion error: " + ex.Message, name);
+                    Interlocked.Increment(ref failedAsync);
+                }
+                total++;
+            } while (true);
+            multiplexer.Trace("Async completion worker processed " + total + " operations", name);
         }
     }
 }
